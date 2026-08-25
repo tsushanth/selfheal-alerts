@@ -1,8 +1,16 @@
 # selfheal-alerts
 
-The alert/approval channel layer for the selfheal project: send an alert
-with candidate runbook actions to a human, get back which action they
-picked (or a plain acknowledge), over whatever chat app they actually use.
+Two pluggable layers for the selfheal project:
+- **`alerts/`** — send an alert with candidate runbook actions to a human,
+  get back which action they picked (or a plain acknowledge), over
+  whatever chat app they actually use.
+- **`engine/`** — run a reasoning turn (plain text or structured JSON)
+  against whichever model/auth path is actually answering.
+
+Not built on HolmesGPT. That project (a separate, existing-systems
+investigation — see `holmesgpt-toolset-flyio`) uses `litellm`, which is
+API-key-only. This project deliberately does not depend on it or on
+`litellm` — see `engine/` below.
 
 ## Why a pluggable interface
 
@@ -39,7 +47,7 @@ alerts/
 - `SlackChannel`: interface stub only. Real implementation needs Block
   Kit buttons + the Events API/interactivity webhook.
 
-## Usage
+## Usage — alerts
 
 ```python
 from alerts.channel import AlertPayload, AlertAction, Severity
@@ -58,3 +66,43 @@ channel.send_alert(AlertPayload(
 for response in channel.poll_responses():
     ...  # look up response.alert_id's runbook, execute response.action_id
 ```
+
+## engine/ — pluggable reasoning, Claude OAuth first
+
+Same pattern as `alerts/`: one `ReasoningEngine` interface
+(`run(prompt, output_schema=None) -> EngineResult`), swap the
+implementation without touching callers.
+
+```
+engine/
+  reasoning_engine.py    — the interface + EngineResult + JSON extraction helper
+  claude_cli_engine.py     — real implementation: `claude -p`, OAuth session, no API key
+  open_source_engine.py     — documented stub (NotImplementedError) for a future LiteLLM/Ollama backend
+```
+
+`ClaudeCliEngine` runs on the local Claude Code OAuth/subscription
+session — no `ANTHROPIC_API_KEY` anywhere in this file, matches this
+portfolio's standing convention for unattended workloads (as opposed to
+the metered-API pattern in `holmesgpt-toolset-flyio/digest.py`).
+
+```python
+from engine.claude_cli_engine import ClaudeCliEngine
+
+engine = ClaudeCliEngine()
+result = engine.run(
+    "A Kokoro TTS service has been timing out at 120s for the last hour.",
+    output_schema={"severity": "low|medium|high|critical", "one_line_summary": "string"},
+)
+result.structured  # {'severity': 'high', 'one_line_summary': '...'} -- or None if parsing failed
+```
+
+Live-tested against the real OAuth session (not mocked) — see commit
+history. `OpenSourceEngine` is an interface stub only; its docstring
+covers the real cost/quality trade-offs of swapping in an open-source
+model later, not just "yes, trivially."
+
+### Status
+
+- `ClaudeCliEngine`: built, unit-tested (mocked subprocess) AND
+  live-tested (real `claude -p` call, real structured JSON parsed back).
+- `OpenSourceEngine`: interface stub only.
