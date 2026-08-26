@@ -1,11 +1,15 @@
 # selfheal-alerts
 
-Two pluggable layers for the selfheal project:
+Three pieces for the selfheal project:
 - **`alerts/`** — send an alert with candidate runbook actions to a human,
   get back which action they picked (or a plain acknowledge), over
   whatever chat app they actually use.
 - **`engine/`** — run a reasoning turn (plain text or structured JSON)
   against whichever model/auth path is actually answering.
+- **`orchestrator/` + `trust/`** — the piece that connects them: draft
+  candidate actions for a new finding, decide (per alert type, based on a
+  real approval-rate history) whether to ask a human or act
+  automatically.
 
 Not built on HolmesGPT. That project (a separate, existing-systems
 investigation — see `holmesgpt-toolset-flyio`) uses `litellm`, which is
@@ -106,3 +110,61 @@ model later, not just "yes, trivially."
 - `ClaudeCliEngine`: built, unit-tested (mocked subprocess) AND
   live-tested (real `claude -p` call, real structured JSON parsed back).
 - `OpenSourceEngine`: interface stub only.
+
+## orchestrator/ + trust/ — the connecting piece
+
+`AlertTrustStore` is the graduation mechanism: per alert type, track a
+real approval-rate history (a single local JSON file, auditable by
+reading it) and use it to decide `MANUAL` vs `AUTO`. Validated against
+real 2026 incident-response practice during design — an "Augment ->
+Delegate" staged trust model where AI proposes and a human approves every
+action until a real track record accumulates, and only then does bounded
+autonomy kick in. New alert types start `MANUAL` and need both enough
+samples AND a high enough approval rate to graduate — either alone isn't
+enough (a few lucky approvals shouldn't graduate an alert type).
+
+`AlertOrchestrator` ties `ReasoningEngine` (drafts candidate actions from
+a finding), `ApprovalChannel` (sends to a human, or just notifies once
+already trusted), and `AlertTrustStore` (decides which) together.
+
+```python
+from alerts.channel import Severity
+from engine.claude_cli_engine import ClaudeCliEngine
+from orchestrator.action_executor import LoggingExecutor
+from orchestrator.alert_orchestrator import AlertOrchestrator
+from trust.alert_trust_store import AlertTrustStore
+from alerts.telegram_channel import TelegramChannel
+
+orch = AlertOrchestrator(
+    engine=ClaudeCliEngine(),
+    channel=TelegramChannel(bot_token="...", chat_id="..."),
+    trust_store=AlertTrustStore(Path("trust.json")),
+    executor=LoggingExecutor(),  # see orchestrator/action_executor.py -- deliberately not a real executor yet
+)
+
+orch.handle_finding(
+    alert_rule_id="kokoro_tts_timeout",
+    title="Kokoro TTS timing out",
+    description="120s timeouts on ai-radio-backend, segments failing",
+    severity=Severity.HIGH,
+)
+
+# in a periodic loop:
+orch.process_responses()  # drains human decisions, feeds the trust store
+```
+
+Live-tested end to end against the real Kokoro TTS incident from this
+project's own history: the real model proposed `restart_kokoro_tts_service`
+and `restart_ai_radio_backend` as candidate actions, unprompted, for the
+exact real issue.
+
+**`LoggingExecutor` is the only executor today, and that's deliberate** —
+see `orchestrator/action_executor.py`'s docstring. Arbitrary remote
+command execution needs its own careful, scoped-permission design first
+(an allowlist, verification, something like HolmesGPT's opt-in
+Kubernetes Remediation MCP's approval-gating + scoped RBAC), not
+something bolted on as a side effect of this piece.
+
+See [`open_questions.md`](open_questions.md) for what's genuinely
+unsolved: no un-graduation mechanism, no verification of the model's own
+action ordering, no dedup for repeated identical findings.
