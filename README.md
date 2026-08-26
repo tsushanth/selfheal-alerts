@@ -1,15 +1,22 @@
 # selfheal-alerts
 
-Three pieces for the selfheal project:
+Five pieces for the selfheal project:
 - **`alerts/`** — send an alert with candidate runbook actions to a human,
   get back which action they picked (or a plain acknowledge), over
   whatever chat app they actually use.
 - **`engine/`** — run a reasoning turn (plain text or structured JSON)
   against whichever model/auth path is actually answering.
-- **`orchestrator/` + `trust/`** — the piece that connects them: draft
-  candidate actions for a new finding, decide (per alert type, based on a
+- **`runbook/`** — the safety boundary: a human-curated allowlist of
+  actions per alert type. The model can only rank/select among these, it
+  can never invent a new one that runs.
+- **`orchestrator/` + `trust/`** — connects the above: draft a selection
+  from the registry for a new finding, decide (per alert type, based on a
   real approval-rate history) whether to ask a human or act
-  automatically.
+  automatically, and actually execute it (`ShellActionExecutor`, with
+  per-action cooldowns and post-run verification).
+- **`observe/`** — the "Observe" phase: watches a log source and turns a
+  known-bad pattern into a finding automatically, instead of a human
+  calling the orchestrator by hand. Debounced per alert type.
 
 Not built on HolmesGPT. That project (a separate, existing-systems
 investigation — see `holmesgpt-toolset-flyio`) uses `litellm`, which is
@@ -111,6 +118,32 @@ model later, not just "yes, trivially."
   live-tested (real `claude -p` call, real structured JSON parsed back).
 - `OpenSourceEngine`: interface stub only.
 
+## runbook/ — the safety boundary
+
+`RunbookRegistry` is a human-curated allowlist: for each `alert_rule_id`,
+a fixed set of `RegisteredAction`s (id, label, fixed `argv`, cooldown, an
+optional post-run HTTP health check). The model's role at alert time is
+narrowed to *ranking/selecting among these* — it never gets to invent a
+new action_id that runs. Anything it returns that isn't in the registry
+for that alert type is silently dropped in `AlertOrchestrator` before it
+ever reaches an executor. Same shape as HolmesGPT's opt-in Kubernetes
+Remediation MCP: an allowlist of specific, reviewed operations, not "run
+this string an LLM produced."
+
+```python
+from runbook.registry import RegisteredAction, RunbookRegistry, VerifySpec
+
+registry = RunbookRegistry()
+registry.register("kokoro_tts_timeout", RegisteredAction(
+    action_id="restart_kokoro_tts_service",
+    label="Restart the Kokoro TTS container on audexa-radio",
+    argv=["ssh", "-i", "~/.ssh/google_compute_engine", "root@178.156.192.31",
+          "cd /opt/audexa-radio && docker compose restart tts-service"],
+    cooldown_sec=600,
+    verify=VerifySpec(url="http://178.156.192.31:8080/health", wait_sec=15),
+))
+```
+
 ## orchestrator/ + trust/ — the connecting piece
 
 `AlertTrustStore` is the graduation mechanism: per alert type, track a
@@ -123,23 +156,28 @@ autonomy kick in. New alert types start `MANUAL` and need both enough
 samples AND a high enough approval rate to graduate — either alone isn't
 enough (a few lucky approvals shouldn't graduate an alert type).
 
-`AlertOrchestrator` ties `ReasoningEngine` (drafts candidate actions from
-a finding), `ApprovalChannel` (sends to a human, or just notifies once
-already trusted), and `AlertTrustStore` (decides which) together.
+`AlertOrchestrator` ties `ReasoningEngine` (selects among registered
+actions for a finding), `RunbookRegistry` (defines what's allowed),
+`ApprovalChannel` (sends to a human, or just notifies once already
+trusted), and `AlertTrustStore` (decides which) together, and calls
+`ActionExecutor` when it's time to actually act.
 
 ```python
+from pathlib import Path
 from alerts.channel import Severity
-from engine.claude_cli_engine import ClaudeCliEngine
-from orchestrator.action_executor import LoggingExecutor
-from orchestrator.alert_orchestrator import AlertOrchestrator
-from trust.alert_trust_store import AlertTrustStore
 from alerts.telegram_channel import TelegramChannel
+from engine.claude_cli_engine import ClaudeCliEngine
+from orchestrator.action_executor import ShellActionExecutor
+from orchestrator.alert_orchestrator import AlertOrchestrator
+from runbook.registry import RunbookRegistry
+from trust.alert_trust_store import AlertTrustStore
 
 orch = AlertOrchestrator(
     engine=ClaudeCliEngine(),
     channel=TelegramChannel(bot_token="...", chat_id="..."),
     trust_store=AlertTrustStore(Path("trust.json")),
-    executor=LoggingExecutor(),  # see orchestrator/action_executor.py -- deliberately not a real executor yet
+    executor=ShellActionExecutor(cooldown_state_path=Path("cooldown.json")),
+    registry=registry,  # from runbook/ above
 )
 
 orch.handle_finding(
@@ -153,18 +191,52 @@ orch.handle_finding(
 orch.process_responses()  # drains human decisions, feeds the trust store
 ```
 
-Live-tested end to end against the real Kokoro TTS incident from this
-project's own history: the real model proposed `restart_kokoro_tts_service`
-and `restart_ai_radio_backend` as candidate actions, unprompted, for the
-exact real issue.
+`ShellActionExecutor` is the first real executor: fixed `argv` (never
+built from model output), per-action cooldown enforced via a local JSON
+file, a timeout, and an optional HTTP verify after running. An execution
+failure in AUTO mode is never swallowed — it routes back to a human
+instead, same as if the alert had never graduated.
 
-**`LoggingExecutor` is the only executor today, and that's deliberate** —
-see `orchestrator/action_executor.py`'s docstring. Arbitrary remote
-command execution needs its own careful, scoped-permission design first
-(an allowlist, verification, something like HolmesGPT's opt-in
-Kubernetes Remediation MCP's approval-gating + scoped RBAC), not
-something bolted on as a side effect of this piece.
+Live-tested end to end, twice: `ClaudeCliEngine` correctly selecting the
+real registered `restart_kokoro_tts_service` action for the real Kokoro
+incident, and `ShellActionExecutor` running a real read-only SSH command
+against the actual Hetzner host and getting real output back.
 
-See [`open_questions.md`](open_questions.md) for what's genuinely
-unsolved: no un-graduation mechanism, no verification of the model's own
-action ordering, no dedup for repeated identical findings.
+## observe/ — watching instead of waiting to be called
+
+`LogPatternObserver` is the "Observe" phase: fetch a log source, check it
+against a list of `WatchedSignature`s (substring match -> alert type),
+fire a finding through the orchestrator for whatever matches — debounced
+per alert type so one ongoing issue doesn't become dozens of findings.
+Same shape as this portfolio's own heal-daemon `known_patterns`
+(log-contains-signature matching), reusing a validated pattern rather
+than inventing a new one. `fetch_logs` is injected, not hardcoded to Fly
+— `fly_log_fetcher()` is the real Fly implementation, reusing the exact
+bounded `fly logs | tail -n 500` already validated in
+`holmesgpt-toolset-flyio`.
+
+```python
+from observe.log_pattern_observer import LogPatternObserver, WatchedSignature, fly_log_fetcher
+
+observer = LogPatternObserver(
+    fetch_logs=fly_log_fetcher("ai-radio-backend"),
+    signatures=[WatchedSignature(
+        alert_rule_id="kokoro_tts_timeout",
+        title="Kokoro TTS timing out",
+        match_substring="Kokoro TTS request timed out",
+        severity=Severity.HIGH,
+    )],
+    orchestrator=orch,
+    debounce_state_path=Path("debounce.json"),
+)
+
+observer.poll()  # call this periodically, e.g. every minute via cron
+```
+
+Live-tested against the real, currently-ongoing `ai-radio-backend`
+issue — 80 matching log lines in one poll produced exactly one finding,
+through the entire real chain (real Fly logs -> real Claude selection ->
+real registered action -> sent alert), not a mock anywhere in the path.
+
+See [`open_questions.md`](open_questions.md) for what's still genuinely
+unsolved, including what's resolved since it was first written.

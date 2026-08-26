@@ -7,11 +7,12 @@ from alerts.channel import AlertPayload, AlertResponse, ApprovalChannel, Severit
 from engine.reasoning_engine import EngineResult, ReasoningEngine
 from orchestrator.action_executor import ActionExecutor, ExecutionResult, LoggingExecutor
 from orchestrator.alert_orchestrator import AlertOrchestrator
+from runbook.registry import RegisteredAction, RunbookRegistry
 from trust.alert_trust_store import AlertOutcome, AlertTrustStore, Decision
 
 
 class FailingExecutor(ActionExecutor):
-    def execute(self, action_id: str) -> ExecutionResult:
+    def execute(self, action) -> ExecutionResult:
         raise RuntimeError("ssh connection refused")
 
 
@@ -40,20 +41,33 @@ class FakeChannel(ApprovalChannel):
         return responses
 
 
-def _orchestrator(tmp_path, structured_response, min_samples=10, approval_rate_threshold=0.85):
+RESTART_ACTION = RegisteredAction(
+    action_id="restart_machine", label="Restart stopped machine", argv=["true"]
+)
+
+
+def _registry_with(*actions_by_rule: tuple[str, RegisteredAction]) -> RunbookRegistry:
+    registry = RunbookRegistry()
+    for rule_id, action in actions_by_rule:
+        registry.register(rule_id, action)
+    return registry
+
+
+def _orchestrator(tmp_path, structured_response, registry=None, min_samples=10, approval_rate_threshold=0.85):
     engine = FakeEngine(structured_response)
     channel = FakeChannel()
     trust_store = AlertTrustStore(
         tmp_path / "trust.json", min_samples=min_samples, approval_rate_threshold=approval_rate_threshold
     )
     executor = LoggingExecutor()
-    orch = AlertOrchestrator(engine, channel, trust_store, executor)
+    registry = registry if registry is not None else _registry_with(("kokoro_tts_timeout", RESTART_ACTION))
+    orch = AlertOrchestrator(engine, channel, trust_store, executor, registry)
     return orch, engine, channel, trust_store, executor
 
 
 def test_new_alert_type_sends_for_manual_approval(tmp_path):
     orch, engine, channel, trust_store, executor = _orchestrator(
-        tmp_path, {"actions": [{"id": "restart_machine", "label": "Restart stopped machine"}]}
+        tmp_path, {"selected_action_ids": ["restart_machine"]}
     )
 
     alert_id = orch.handle_finding("kokoro_tts_timeout", "TTS timing out", "120s timeouts", Severity.HIGH)
@@ -64,9 +78,35 @@ def test_new_alert_type_sends_for_manual_approval(tmp_path):
     assert executor.log == []  # nothing executed in manual mode
 
 
+def test_model_selecting_an_unregistered_id_is_silently_dropped(tmp_path):
+    """The actual safety boundary: the model can say whatever it wants,
+    only pre-registered ids ever make it through."""
+    orch, engine, channel, trust_store, executor = _orchestrator(
+        tmp_path, {"selected_action_ids": ["rm_dash_rf_everything", "restart_machine"]}
+    )
+
+    orch.handle_finding("kokoro_tts_timeout", "t", "d", Severity.HIGH)
+
+    ids_sent = [a.id for a in channel.sent[0].actions]
+    assert ids_sent == ["restart_machine"]
+    assert "rm_dash_rf_everything" not in ids_sent
+
+
+def test_alert_type_with_no_registered_actions_gets_no_actions_regardless_of_model(tmp_path):
+    registry = RunbookRegistry()  # nothing registered for anything
+    orch, engine, channel, trust_store, executor = _orchestrator(
+        tmp_path, {"selected_action_ids": ["restart_machine"]}, registry=registry
+    )
+
+    orch.handle_finding("unregistered_alert", "t", "d", Severity.LOW)
+
+    assert channel.sent[0].actions == []
+    assert engine.last_prompt is None  # never even asked the model -- nothing to select from
+
+
 def test_approved_response_records_approved_outcome(tmp_path):
     orch, engine, channel, trust_store, executor = _orchestrator(
-        tmp_path, {"actions": [{"id": "restart_machine", "label": "Restart"}]}
+        tmp_path, {"selected_action_ids": ["restart_machine"]}
     )
     alert_id = orch.handle_finding("kokoro_tts_timeout", "t", "d", Severity.HIGH)
 
@@ -81,8 +121,9 @@ def test_approved_response_records_approved_outcome(tmp_path):
 
 
 def test_dismissed_response_records_dismissed_outcome(tmp_path):
+    registry = _registry_with(("noisy_alert", RESTART_ACTION))
     orch, engine, channel, trust_store, executor = _orchestrator(
-        tmp_path, {"actions": [{"id": "restart_machine", "label": "Restart"}]}
+        tmp_path, {"selected_action_ids": ["restart_machine"]}, registry=registry
     )
     alert_id = orch.handle_finding("noisy_alert", "t", "d", Severity.LOW)
 
@@ -93,7 +134,7 @@ def test_dismissed_response_records_dismissed_outcome(tmp_path):
 
 
 def test_response_to_unknown_alert_id_is_ignored(tmp_path):
-    orch, *_ = _orchestrator(tmp_path, {"actions": []})
+    orch, *_ = _orchestrator(tmp_path, {"selected_action_ids": []})
     orch.channel.queued_responses = [
         AlertResponse(alert_id="not-a-real-alert", action_id="x", responded_by="sushanth")
     ]
@@ -103,7 +144,7 @@ def test_response_to_unknown_alert_id_is_ignored(tmp_path):
 def test_graduated_alert_type_executes_automatically(tmp_path):
     orch, engine, channel, trust_store, executor = _orchestrator(
         tmp_path,
-        {"actions": [{"id": "restart_machine", "label": "Restart"}]},
+        {"selected_action_ids": ["restart_machine"]},
         min_samples=1,
         approval_rate_threshold=0.5,
     )
@@ -121,16 +162,16 @@ def test_graduated_alert_type_executes_automatically(tmp_path):
 
 
 def test_graduated_alert_type_with_no_safe_actions_falls_back_to_manual(tmp_path):
-    """If the engine can't propose anything safe, AUTO mode should not
-    silently do nothing -- it must still reach a human."""
+    """If nothing selected applies, AUTO mode should not silently do
+    nothing -- it must still reach a human."""
     orch, engine, channel, trust_store, executor = _orchestrator(
-        tmp_path, {"actions": []}, min_samples=1, approval_rate_threshold=0.5
+        tmp_path, {"selected_action_ids": []}, min_samples=1, approval_rate_threshold=0.5
     )
     trust_store.record_outcome(
-        AlertOutcome(alert_rule_id="weird_alert", decision=Decision.APPROVED, at="2026-08-01T00:00:00Z")
+        AlertOutcome(alert_rule_id="kokoro_tts_timeout", decision=Decision.APPROVED, at="2026-08-01T00:00:00Z")
     )
 
-    alert_id = orch.handle_finding("weird_alert", "t", "d", Severity.CRITICAL)
+    alert_id = orch.handle_finding("kokoro_tts_timeout", "t", "d", Severity.CRITICAL)
 
     assert executor.log == []
     assert len(channel.sent) == 1
@@ -141,13 +182,14 @@ def test_failed_auto_execution_still_reaches_a_human(tmp_path):
     """A failure in AUTO mode must not be swallowed -- it needs to reach
     someone, and the alert must go back to pending since the action never
     actually happened."""
-    engine = FakeEngine({"actions": [{"id": "restart_machine", "label": "Restart"}]})
+    engine = FakeEngine({"selected_action_ids": ["restart_machine"]})
     channel = FakeChannel()
     trust_store = AlertTrustStore(tmp_path / "trust.json", min_samples=1, approval_rate_threshold=0.5)
     trust_store.record_outcome(
         AlertOutcome(alert_rule_id="kokoro_tts_timeout", decision=Decision.APPROVED, at="2026-08-01T00:00:00Z")
     )
-    orch = AlertOrchestrator(engine, channel, trust_store, FailingExecutor())
+    registry = _registry_with(("kokoro_tts_timeout", RESTART_ACTION))
+    orch = AlertOrchestrator(engine, channel, trust_store, FailingExecutor(), registry)
 
     alert_id = orch.handle_finding("kokoro_tts_timeout", "t", "d", Severity.HIGH)
 
@@ -158,6 +200,6 @@ def test_failed_auto_execution_still_reaches_a_human(tmp_path):
 
 
 def test_engine_failure_to_produce_structured_output_yields_no_actions(tmp_path):
-    orch, engine, channel, trust_store, executor = _orchestrator(tmp_path, None)  # simulates parse failure
-    orch.handle_finding("some_alert", "t", "d", Severity.MEDIUM)
+    orch, engine, channel, trust_store, executor = _orchestrator(tmp_path, None)
+    orch.handle_finding("kokoro_tts_timeout", "t", "d", Severity.MEDIUM)
     assert channel.sent[0].actions == []
